@@ -1,6 +1,11 @@
 import { Characteristic } from "react-native-ble-plx";
 import { base64ToHex, hexToBase64 } from "../utils";
 
+/*
+There is a lot of documentation on the CS108 RFID reader here: https://www.convergence.com.hk/cs710s/
+The docs include example native apps. We only use a small subset of the functionality.
+*/
+
 export const CS108_NAME_REGEX = "CS108";
 export const CS108_EID_SERVICE_PREFIX = "00009800";
 export const CS108_EID_SERVICE_CHARACTERISTIC_READ_PREFIX = "00009901";
@@ -54,17 +59,29 @@ const defaultCommandHeader =
   DOWNLINK_CRC2;
 
 const RFID_COMMAND = "8002";
-const START_INVENTORY = RFID_COMMAND + "700100f00f000000"; // Start inventory operation
-const ABORT_INVENTORY = RFID_COMMAND + "4003000000000000";
+
+// Commands to send
 const TURN_ON_RFID = "8000"; // Turn on RFID module
 const ANT_PORT_SEL = RFID_COMMAND + "7001010700000000"; // Select the antenna port
 const ANT_PORT_POWER = RFID_COMMAND + "700106072c010000"; // Set the output power for the logical antenna
 const USE_CURRENT_PROFILE = RFID_COMMAND + "7001600b01000000"; // Use the current profile
+const ENABLE_PROFILE = RFID_COMMAND + "700100F019000000";
 const ANT_CYCLES = RFID_COMMAND + "70010007ffff0000"; // Specify the number of times the enabled logical antenna port should be cycled through in order to complete protocol command execution
 const QUERY_CFG = RFID_COMMAND + "7001000920000000";
-const INV_SEL = RFID_COMMAND + "7001020901000000";
-const INV_ALG_PARM_0 = RFID_COMMAND + "70010309f7005003";
-const INV_CFG = RFID_COMMAND + "7001010901000000";
+const INV_SEL = RFID_COMMAND + "7001020903000000";
+const INV_ALG_PARM_0 = RFID_COMMAND + "70010309F6400000";
+const INV_ALG_PARM_1 = RFID_COMMAND + "7001040900000000";
+const INV_ALG_PARM_2 = RFID_COMMAND + "7001050901000000";
+const INV_CFG = RFID_COMMAND + "7001010903000404";
+
+//Start inventory operation
+const HST_PWRMGMT_HIGH = RFID_COMMAND + "7001000200000000";
+const HST_CMD = RFID_COMMAND + "700100F014000000";
+const START_INVENTORY = RFID_COMMAND + "700100f00f000000"; // Start inventory operation
+
+//Stop Inventory operation
+const HST_PWRMGMT_LOW = RFID_COMMAND + "7001000201000000";
+const ABORT_INVENTORY = RFID_COMMAND + "4003000000000000";
 
 const isNotification = (value: string) => {
   return value.substring(6, 8) === DESTINATION.NOTIFICATION;
@@ -82,6 +99,16 @@ const getEventCode = (value: string) => {
   return value.substring(16, 20);
 };
 
+const getTagValue = (value: string) => {
+  const reversedHex = value.substring(24);
+  const hexTag = reversedHex
+    .match(/[a-fA-F0-9]{2}/g)
+    ?.reverse()
+    .join("");
+  console.log("hexTag: ", hexTag);
+  return value.substring(16, 20);
+};
+
 const SendCommand = async (command: string, writeCharacteristic?: Characteristic | null) => {
   if (!writeCharacteristic) {
     console.log("no writeCharacteristic");
@@ -90,22 +117,25 @@ const SendCommand = async (command: string, writeCharacteristic?: Characteristic
   const fullCommand = defaultCommandHeader + command;
   const commandBase64 = hexToBase64(fullCommand);
   await writeCharacteristic.writeWithResponse(commandBase64);
-  console.log("Command sent: ", fullCommand);
+  console.log("BLE packet sent: ", fullCommand);
 };
 
-// Take the data listened to from the CS108 and process it. If tag data than store it, if trigger then start/start inventory
 export const processCS108Data = async (value: string, writeCharacteristic?: Characteristic | null) => {
   const decodedValue = base64ToHex(value);
+  console.log("BLE packet received: ", decodedValue);
   if (isNotification(decodedValue)) {
     const payload = getPayload(decodedValue);
     switch (payload) {
       case NOTIFICATION.TRIGGER_PUSHED:
         console.log("trigger pushed");
+        SendCommand(HST_PWRMGMT_HIGH, writeCharacteristic);
+        SendCommand(HST_CMD, writeCharacteristic);
         SendCommand(START_INVENTORY, writeCharacteristic);
         break;
       case NOTIFICATION.TRIGGER_RELEASED:
         console.log("trigger released");
         SendCommand(ABORT_INVENTORY, writeCharacteristic);
+        SendCommand(HST_PWRMGMT_LOW, writeCharacteristic);
         break;
     }
   }
@@ -118,23 +148,32 @@ export const processCS108Data = async (value: string, writeCharacteristic?: Char
     }
   }
   return {};
+  // return { eid: decodedValue, eidCreatedAt: Date.now().toString() };
 };
 
-// Set required parameters when initially connecting the the CS108
+/*
+03328B945DCDA1 hex to decimal -> 900000001150369
+hex received from reader: 018208 A1CD5D948B3203 007101000000 (018208 A1CD5D948B3203 007101000000 4E400001)
+A1 CD 5D 94 8B 32 03 reversered is 03 32 8B 94 5D CD A1
+BLE Packet received: A7B330C23F9E9B1A810004000580260000004000018208A1CD5D948B3203007101000000304000018207B4CD5D948B320300840100000048
+*/
 export const startRFIDReader = async (writeCharacteristic: Characteristic) => {
-  const commandsByBook = [
+  const commands = [
     TURN_ON_RFID,
     ANT_PORT_SEL,
     ANT_PORT_POWER,
     USE_CURRENT_PROFILE,
+    ENABLE_PROFILE,
     ANT_CYCLES,
     QUERY_CFG,
     INV_SEL,
     INV_ALG_PARM_0,
+    INV_ALG_PARM_1,
+    INV_ALG_PARM_2,
     INV_CFG,
   ];
 
-  commandsByBook.forEach(async (command) => {
+  commands.forEach((command) => {
     SendCommand(command, writeCharacteristic);
   });
 };
