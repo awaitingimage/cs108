@@ -1,5 +1,5 @@
 import { Characteristic } from "react-native-ble-plx";
-import { base64ToHex, hexToBase64 } from "../utils";
+import { base64ToHex, hexToBase64, hexToNumber } from "../utils";
 
 /*
 There is a lot of documentation on the CS108 RFID reader here: https://www.convergence.com.hk/cs710s/
@@ -74,13 +74,7 @@ const INV_ALG_PARM_1 = RFID_COMMAND + "7001040900000000";
 const INV_ALG_PARM_2 = RFID_COMMAND + "7001050901000000";
 const INV_CFG = RFID_COMMAND + "7001010903000404";
 
-//Start inventory operation
-const HST_PWRMGMT_HIGH = RFID_COMMAND + "7001000200000000";
-const HST_CMD = RFID_COMMAND + "700100F014000000";
-const START_INVENTORY = RFID_COMMAND + "700100f00f000000"; // Start inventory operation
-
-//Stop Inventory operation
-const HST_PWRMGMT_LOW = RFID_COMMAND + "7001000201000000";
+const START_INVENTORY = RFID_COMMAND + "700100f00f000000";
 const ABORT_INVENTORY = RFID_COMMAND + "4003000000000000";
 
 const isNotification = (value: string) => {
@@ -99,14 +93,14 @@ const getEventCode = (value: string) => {
   return value.substring(16, 20);
 };
 
-const getTagValue = (value: string) => {
-  const reversedHex = value.substring(24);
+// EPC for the tags we have 018208A1CD5D948B3203007101000000, A1CD5D948B3203 reversed converts to the visual ID on the tag
+const extractVIDFromEPC = (value: string) => {
+  const reversedHex = value.substring(6, 20);
   const hexTag = reversedHex
     .match(/[a-fA-F0-9]{2}/g)
     ?.reverse()
     .join("");
-  console.log("hexTag: ", hexTag);
-  return value.substring(16, 20);
+  return hexToNumber(hexTag);
 };
 
 const SendCommand = async (command: string, writeCharacteristic?: Characteristic | null) => {
@@ -117,45 +111,89 @@ const SendCommand = async (command: string, writeCharacteristic?: Characteristic
   const fullCommand = defaultCommandHeader + command;
   const commandBase64 = hexToBase64(fullCommand);
   await writeCharacteristic.writeWithResponse(commandBase64);
-  console.log("BLE packet sent: ", fullCommand);
+  console.log("BLE sent: ", fullCommand);
 };
 
-export const processCS108Data = async (value: string, writeCharacteristic?: Characteristic | null) => {
+// Due to MTU limitation we don't get the tag read ble data in one go. We need to buffer it and then process it.
+let currentDataStream = "";
+
+const extractTagData = (payload: string) => {
+  if (!payload || payload.length < 4) {
+    throw new Error("Invalid payload");
+  }
+  const productCodeDecimal = hexToNumber(payload.substring(0, 4));
+  if (!productCodeDecimal) {
+    throw new Error("Invalid product code");
+  }
+  // eslint-disable-next-line no-bitwise
+  const epcByteLength = (productCodeDecimal >> 11) * 2;
+  const epc = payload.substring(4, 4 + epcByteLength * 2);
+  const rssi = payload.substring(4 + epcByteLength * 2, 4 + epcByteLength * 2 + 2);
+  const remainingPayload = payload.substring(4 + epcByteLength * 2 + 2);
+  return { epc, rssi: hexToNumber(rssi), remainingPayload };
+};
+
+/* We want something like this (spaces are only there in this comment to make it more readable):
+A7B330C2259E994A 8100 04 00 0580 2600 00 00 4000 018208A1CD5D948B3203007101000000 60 4000 018207B4CD5D948B3203008401000000 5C
+*/
+const processTagData = () => {
+  if (!currentDataStream) {
+    return;
+  }
+  try {
+    let tagReadPayload = currentDataStream.substring(36);
+    while (tagReadPayload.length > 0) {
+      const { epc, remainingPayload } = extractTagData(tagReadPayload);
+      console.log("VID: ", extractVIDFromEPC(epc));
+      tagReadPayload = remainingPayload;
+    }
+  } catch (error) {
+    console.log("error: ", error);
+    currentDataStream = "";
+    return;
+  }
+
+  currentDataStream = "";
+};
+
+export const processCS108Data = (value: string, writeCharacteristic?: Characteristic | null) => {
   const decodedValue = base64ToHex(value);
-  console.log("BLE packet received: ", decodedValue);
   if (isNotification(decodedValue)) {
+    processTagData();
     const payload = getPayload(decodedValue);
     switch (payload) {
       case NOTIFICATION.TRIGGER_PUSHED:
         console.log("trigger pushed");
-        SendCommand(HST_PWRMGMT_HIGH, writeCharacteristic);
-        SendCommand(HST_CMD, writeCharacteristic);
         SendCommand(START_INVENTORY, writeCharacteristic);
         break;
       case NOTIFICATION.TRIGGER_RELEASED:
         console.log("trigger released");
         SendCommand(ABORT_INVENTORY, writeCharacteristic);
-        SendCommand(HST_PWRMGMT_LOW, writeCharacteristic);
         break;
     }
+    return;
   }
   if (isRFID(decodedValue)) {
+    processTagData();
     const eventCode = getEventCode(decodedValue);
     switch (eventCode) {
+      case RFID_COMMAND:
+        console.log("RFID command confirmation: ", decodedValue);
+        break;
       case EVENT_CODE.TAG_READ:
+        currentDataStream = decodedValue;
         console.log("tag read:", decodedValue);
         break;
     }
+    return;
   }
-  return {};
-  // return { eid: decodedValue, eidCreatedAt: Date.now().toString() };
+  console.log("BLE recieved and not processed: ", decodedValue);
+  currentDataStream += decodedValue;
+  return {}; // We don't return tag data here as this is done in processTagData
 };
 
 /*
-03328B945DCDA1 hex to decimal -> 900000001150369
-hex received from reader: 018208 A1CD5D948B3203 007101000000 (018208 A1CD5D948B3203 007101000000 4E400001)
-A1 CD 5D 94 8B 32 03 reversered is 03 32 8B 94 5D CD A1
-BLE Packet received: A7B330C23F9E9B1A810004000580260000004000018208A1CD5D948B3203007101000000304000018207B4CD5D948B320300840100000048
+Issue commands required to turn on RFID and setup ready for scanning
 */
 export const startRFIDReader = async (writeCharacteristic: Characteristic) => {
   const commands = [
